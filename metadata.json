@@ -1,0 +1,5 @@
+{
+  "name": "Pathfinder AI",
+  "description": "A business scheduling tool that breaks down large tasks into actionable micro-tasks with a 15-minute sprint timer.",
+  "requestFramePermissions": []
+}
