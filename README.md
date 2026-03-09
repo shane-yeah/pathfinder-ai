@@ -7,7 +7,7 @@ Pathfinder AI 是一個專為專業人士打造的生產力工具。它能將龐
 ## ✨ 核心功能 (Features)
 
 *   **🧠 智能任務拆解 (AI Task Deconstruction)**
-    *   串接 Google Gemini 3.1 Pro 模型，自動將大目標拆解為具體的微任務。
+    *   串接 Google Gemini 2.5 flash 模型，自動將大目標拆解為具體的微任務。
     *   精準評估每個任務的預估時間（Estimated Minutes）。
     *   自動判斷任務屬性：`CRITICAL`（關鍵阻擋節點）或 `PARALLEL`（可並行任務）。
 *   **🔗 拓撲時序鎖定機制 (Visual Timeline)**
@@ -81,5 +81,5 @@ npm run dev
 *   **前端框架**: React 19
 *   **建置工具**: Vite
 *   **樣式框架**: Tailwind CSS 4
-*   **AI 串接**: `@google/genai` (Gemini 3.1 Pro Preview)
+*   **AI 串接**: `@google/genai` (Gemini 2.5 flash)
 *   **圖示庫**: Lucide React
