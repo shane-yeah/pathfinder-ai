@@ -4,117 +4,112 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { GoogleGenAI, Type } from '@google/genai';
-import { Play, Pause, CheckCircle, Lock, Sparkles, Target, Clock, Activity, ArrowRight } from 'lucide-react';
+import { Play, Pause, CheckCircle, Lock, Sparkles, Target, Clock, Activity, ArrowRight, Server } from 'lucide-react';
 
 type TaskType = 'critical' | 'parallel';
 
 interface MicroTask {
-  id: string;
+  task_id: string;
   task_name: string;
   estimated_minutes: number;
   type: TaskType;
+  dependencies: string[];
   status: 'locked' | 'todo' | 'in_progress' | 'done';
   summary_when_done: string;
 }
 
+// MCP Server 端點（本機開發預設）
+const MCP_URL = import.meta.env.VITE_MCP_URL || 'http://localhost:3001';
+
 export default function App() {
-  const [apiKey, setApiKey] = useState(process.env.GEMINI_API_KEY || '');
   const [goal, setGoal] = useState('');
   const [loading, setLoading] = useState(false);
   const [tasks, setTasks] = useState<MicroTask[]>([]);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
-  const [timeLeft, setTimeLeft] = useState(0); // 初始設為 0，等點擊任務時再動態賦值
+  const [timeLeft, setTimeLeft] = useState(0);
   const [timerRunning, setTimerRunning] = useState(false);
+  const [mcpUrl, setMcpUrl] = useState(MCP_URL);
+  const [mcpStatus, setMcpStatus] = useState<'unknown' | 'online' | 'offline'>('unknown');
 
   // Timer logic
   useEffect(() => {
     let interval: NodeJS.Timeout;
     if (timerRunning && timeLeft > 0) {
-      interval = setInterval(() => {
-        setTimeLeft(prev => prev - 1);
-      }, 1000);
+      interval = setInterval(() => setTimeLeft(prev => prev - 1), 1000);
     } else if (timeLeft === 0) {
       setTimerRunning(false);
     }
     return () => clearInterval(interval);
   }, [timerRunning, timeLeft]);
 
+  // 健康檢查 MCP Server
+  const checkMcpStatus = async () => {
+    try {
+      const res = await fetch(`${mcpUrl}/`, { signal: AbortSignal.timeout(3000) });
+      setMcpStatus(res.ok ? 'online' : 'offline');
+    } catch {
+      setMcpStatus('offline');
+    }
+  };
+
+  useEffect(() => {
+    checkMcpStatus();
+  }, [mcpUrl]);
+
+  // 呼叫 MCP Server 的 decompose_task Tool
   const generateTasks = async () => {
     if (!goal.trim()) return;
     setLoading(true);
     try {
-      const ai = new GoogleGenAI({ apiKey: apiKey });
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: `I need to accomplish this goal: "${goal}". Break it down into 3 to 5 micro-tasks.`,
-        config: {
-          systemInstruction: "You are a world-class business productivity coach. Break down the user's goal into 3-5 actionable micro-tasks. For each task, provide a task_name, estimated_minutes (e.g., 15, 30), type ('critical' if it blocks subsequent tasks, 'parallel' if it can be done independently), and a summary_when_done (a short professional summary of what is achieved, e.g., 'Unlocked subsequent parallel tasks, efficiency improved').",
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                task_name: { type: Type.STRING },
-                estimated_minutes: { type: Type.INTEGER },
-                type: { type: Type.STRING },
-                summary_when_done: { type: Type.STRING }
-              },
-              required: ["task_name", "estimated_minutes", "type", "summary_when_done"]
-            }
-          }
-        }
+      const res = await fetch(`${mcpUrl}/tools/decompose_task`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ goal })
       });
 
-      if (response.text) {
-        const parsed = JSON.parse(response.text);
-        const newTasks: MicroTask[] = parsed.map((t: any, i: number) => ({
-          id: `task-${Date.now()}-${i}`,
-          ...t,
-          status: 'todo'
-        }));
-        setTasks(newTasks);
-        setActiveTaskId(null);
-        setTimerRunning(false);
+      const data = await res.json();
+
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || '任務拆解失敗，請確認 MCP Server 是否運行中');
       }
-    } catch (err) {
-      console.error(err);
-      alert("Failed to generate tasks. Please check your API key and try again.");
+
+      const newTasks: MicroTask[] = data.tasks.map((t: Omit<MicroTask, 'status'>) => ({
+        ...t,
+        status: 'todo' as const
+      }));
+
+      setTasks(newTasks);
+      setActiveTaskId(null);
+      setTimerRunning(false);
+    } catch (err: any) {
+      alert(err.message);
     } finally {
       setLoading(false);
     }
   };
 
-  const isTaskLocked = (index: number) => {
-    for (let i = 0; i < index; i++) {
-      if (tasks[i].type === 'critical' && tasks[i].status !== 'done') {
-        return true;
-      }
-    }
-    return false;
+  // 鎖定邏輯：依 dependencies 判斷（而非順序）
+  const isTaskLocked = (task: MicroTask) => {
+    return task.dependencies.some(depId => {
+      const dep = tasks.find(t => t.task_id === depId);
+      return dep && dep.status !== 'done';
+    });
   };
 
-  const startTask = (id: string) => {
-    // 1. 先從 tasks 陣列中，找出被點擊的那個任務
-    const taskToStart = tasks.find(t => t.id === id);
-    
-    if (taskToStart) {
-      setActiveTaskId(id);
-      // 2. 將該任務的 estimated_minutes 乘以 60 轉換為秒數
-      setTimeLeft(taskToStart.estimated_minutes * 60); 
-      setTimerRunning(true);
-      // 3. 更新任務狀態為進行中
-      setTasks(tasks.map(t => t.id === id ? { ...t, status: 'in_progress' } : t));
-    }
+  const startTask = (task_id: string) => {
+    const task = tasks.find(t => t.task_id === task_id);
+    if (!task) return;
+    setActiveTaskId(task_id);
+    setTimeLeft(task.estimated_minutes * 60);
+    setTimerRunning(true);
+    setTasks(tasks.map(t => t.task_id === task_id ? { ...t, status: 'in_progress' } : t));
   };
 
   const completeTask = () => {
-    if (activeTaskId) {
-      setTasks(tasks.map(t => t.id === activeTaskId ? { ...t, status: 'done' } : t));
-      setActiveTaskId(null);
-      setTimerRunning(false);
-    }
+    if (!activeTaskId) return;
+    setTasks(tasks.map(t => t.task_id === activeTaskId ? { ...t, status: 'done' } : t));
+    setActiveTaskId(null);
+    setTimerRunning(false);
   };
 
   const formatTime = (seconds: number) => {
@@ -123,9 +118,20 @@ export default function App() {
     return `${m}:${s}`;
   };
 
-  const activeTask = tasks.find(t => t.id === activeTaskId);
-  // 計算該任務的總秒數 (如果找不到就預設給 1，避免數學上除以 0 的錯誤)
+  const activeTask = tasks.find(t => t.task_id === activeTaskId);
   const totalSeconds = activeTask ? activeTask.estimated_minutes * 60 : 1;
+
+  const statusColor = {
+    unknown: 'text-slate-400',
+    online: 'text-emerald-400',
+    offline: 'text-rose-400',
+  }[mcpStatus];
+
+  const statusLabel = {
+    unknown: '檢查中...',
+    online: 'MCP Server 連線中',
+    offline: 'MCP Server 離線',
+  }[mcpStatus];
 
   return (
     <div className="min-h-screen bg-slate-900 text-slate-200 font-sans selection:bg-cyan-500/30 pb-20">
@@ -138,14 +144,18 @@ export default function App() {
             </div>
             <h1 className="text-xl font-semibold tracking-wide text-white">Pathfinder AI</h1>
           </div>
+          {/* MCP Server URL 輸入 */}
           <div className="flex items-center gap-3">
+            <Server className="w-4 h-4 text-slate-500" />
             <input
-              type="password"
-              value={apiKey}
-              onChange={e => setApiKey(e.target.value)}
-              placeholder="Gemini API Key..."
+              type="text"
+              value={mcpUrl}
+              onChange={e => setMcpUrl(e.target.value)}
+              onBlur={checkMcpStatus}
+              placeholder="MCP Server URL..."
               className="bg-slate-950 border border-slate-800 rounded-lg px-4 py-1.5 text-sm text-slate-300 focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 transition-all w-64 placeholder-slate-600"
             />
+            <span className={`text-xs font-mono ${statusColor}`}>{statusLabel}</span>
           </div>
         </div>
       </header>
@@ -161,12 +171,12 @@ export default function App() {
             <textarea
               value={goal}
               onChange={e => setGoal(e.target.value)}
-              placeholder="Describe your large, vague task here...&#10;e.g., 'Prepare for the Q3 marketing campaign launch'"
+              placeholder={"Describe your large, vague task here...\ne.g., 'Prepare for the Q3 marketing campaign launch'"}
               className="w-full h-40 bg-slate-900/80 border border-slate-700 rounded-xl p-4 text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 transition-all resize-none mb-4 leading-relaxed"
             />
             <button
               onClick={generateTasks}
-              disabled={loading || !goal.trim() || !apiKey}
+              disabled={loading || !goal.trim() || mcpStatus === 'offline'}
               className="w-full py-3.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-900 font-semibold flex items-center justify-center gap-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-[0_0_20px_rgba(6,182,212,0.3)] hover:shadow-[0_0_25px_rgba(6,182,212,0.5)]"
             >
               {loading ? (
@@ -175,12 +185,15 @@ export default function App() {
                 <><Sparkles className="w-5 h-5" /> Deconstruct Task</>
               )}
             </button>
-            {!apiKey && (
-              <p className="text-xs text-rose-400 mt-3 text-center">Please enter your Gemini API Key in the top right.</p>
+            {mcpStatus === 'offline' && (
+              <p className="text-xs text-rose-400 mt-3 text-center">
+                MCP Server 離線，請執行：<br />
+                <code className="font-mono">node --env-file=.env mcp_server.mjs</code>
+              </p>
             )}
           </div>
 
-          {/* Stats / Info Card */}
+          {/* Stats */}
           {tasks.length > 0 && (
             <div className="bg-slate-800/30 rounded-2xl p-6 border border-slate-700/30">
               <h3 className="text-sm font-medium text-slate-400 mb-4 uppercase tracking-wider">Mission Overview</h3>
@@ -208,7 +221,7 @@ export default function App() {
         <div className="lg:col-span-8">
           {/* Sprint Timer Banner */}
           {activeTaskId && (
-            <div className="mb-8 p-6 rounded-2xl bg-slate-800 border border-cyan-500/40 shadow-[0_0_30px_rgba(6,182,212,0.15)] relative overflow-hidden group">
+            <div className="mb-8 p-6 rounded-2xl bg-slate-800 border border-cyan-500/40 shadow-[0_0_30px_rgba(6,182,212,0.15)] relative overflow-hidden">
               <div className="absolute top-0 left-0 w-full h-1.5 bg-slate-900">
                 <div
                   className="h-full bg-cyan-400 shadow-[0_0_15px_rgba(6,182,212,1)] transition-all duration-1000 ease-linear"
@@ -222,7 +235,7 @@ export default function App() {
                     Aurora Sprint Active
                   </h2>
                   <p className="text-xl text-white font-medium leading-snug">
-                    {tasks.find(t => t.id === activeTaskId)?.task_name}
+                    {tasks.find(t => t.task_id === activeTaskId)?.task_name}
                   </p>
                 </div>
                 <div className="flex flex-col items-end gap-4">
@@ -256,13 +269,13 @@ export default function App() {
                 Execution Timeline
               </h2>
               <div className="relative border-l-2 border-slate-700/50 ml-4 space-y-8 py-2">
-                {tasks.map((task, index) => {
-                  const locked = isTaskLocked(index);
-                  const isActive = activeTaskId === task.id;
+                {tasks.map((task) => {
+                  const locked = isTaskLocked(task);
+                  const isActive = activeTaskId === task.task_id;
                   const isDone = task.status === 'done';
 
                   return (
-                    <div key={task.id} className="relative pl-8 group">
+                    <div key={task.task_id} className="relative pl-8 group">
                       {/* Node Circle */}
                       <div className={`absolute -left-[11px] top-4 w-5 h-5 rounded-full border-2 flex items-center justify-center bg-slate-900 transition-colors duration-300
                         ${isDone ? 'border-cyan-400 shadow-[0_0_15px_rgba(6,182,212,0.8)]' :
@@ -281,14 +294,15 @@ export default function App() {
                             locked ? 'bg-slate-800/20 border-slate-800 opacity-50' :
                             'bg-slate-800/80 border-slate-700 hover:border-slate-600 cursor-pointer hover:shadow-lg hover:shadow-black/20'}
                         `}
-                        onClick={() => {
-                          if (!locked && !isDone && !isActive) startTask(task.id);
-                        }}
+                        onClick={() => { if (!locked && !isDone && !isActive) startTask(task.task_id); }}
                       >
                         <div className="flex flex-col sm:flex-row sm:justify-between sm:items-start gap-4 mb-2">
-                          <h3 className={`font-medium text-lg leading-snug ${isDone || isActive ? 'text-white' : locked ? 'text-slate-500' : 'text-slate-200'}`}>
-                            {task.task_name}
-                          </h3>
+                          <div>
+                            <span className="text-xs text-slate-500 font-mono mr-2">{task.task_id}</span>
+                            <span className={`font-medium text-lg leading-snug ${isDone || isActive ? 'text-white' : locked ? 'text-slate-500' : 'text-slate-200'}`}>
+                              {task.task_name}
+                            </span>
+                          </div>
                           <div className="flex items-center gap-2 text-xs font-mono shrink-0">
                             <span className={`px-2.5 py-1 rounded-md border ${
                               task.type === 'critical'
@@ -303,6 +317,17 @@ export default function App() {
                           </div>
                         </div>
 
+                        {/* Dependencies badge */}
+                        {task.dependencies.length > 0 && (
+                          <div className="mt-1 flex items-center gap-1 flex-wrap">
+                            {task.dependencies.map(dep => (
+                              <span key={dep} className="text-xs px-2 py-0.5 rounded bg-slate-900 text-slate-500 font-mono border border-slate-700">
+                                ← {dep}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+
                         {isDone && (
                           <div className="mt-4 text-sm text-cyan-100 flex items-start gap-3 bg-cyan-950/40 p-3.5 rounded-lg border border-cyan-800/50">
                             <Sparkles className="w-4 h-4 mt-0.5 shrink-0 text-cyan-400" />
@@ -313,7 +338,7 @@ export default function App() {
                         {locked && !isDone && (
                           <div className="mt-3 flex items-center gap-2 text-sm text-slate-500">
                             <Lock className="w-4 h-4" />
-                            <span>Locked: Complete previous critical tasks to unlock</span>
+                            <span>等待前置任務完成：{task.dependencies.join(', ')}</span>
                           </div>
                         )}
 
